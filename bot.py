@@ -1,75 +1,86 @@
 # bot.py ── Google-Drive Uploader Telegram Bot
 #
-# Build locally
+# Build locally:
 #   pip install -r requirements.txt
 #   python bot.py
 #
-# Requirements (already in requirements.txt):
-#   pyrogram          tgcrypto
-#   google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
-#   python-dotenv     (local dev only)
+# Requirements (put in requirements.txt):
+#   pyrogram>=2.0.106
+#   tgcrypto>=1.2.5
+#   google-api-python-client>=2.118.0
+#   google-auth>=2.29.0
+#   google-auth-httplib2>=0.2.0
+#   google-auth-oauthlib>=1.2.0
+#   python-dotenv>=1.0.1
 #
-# -----------------------  Environment variables  -----------------------
-#  APP_ID                12345678
-#  API_HASH              0123456789abcdef0123456789abcdef
-#  BOT_TOKEN             123456:ABCdefGhIJK-LMNOPqrsTuVwxyZ
-#
-#  -- Service-account key (choose ONE method) --
-#  a) Mount a real file and set          SERVICE_ACCOUNT_FILE=/etc/secrets/sa.json
-#  b) Paste the whole JSON in            SA_JSON={...}           (Railway style)
-#     and set                            SERVICE_ACCOUNT_FILE=sa.json
-#
-#  DRIVE_FOLDER_ID       1AbCdEfGhIJkLmNoPQ   (optional, uploads to My Drive root if blank)
-# ----------------------------------------------------------------------
+# Environment variables (Railway/Render dashboard or .env file):
+#   APP_ID=12345678
+#   API_HASH=0123456789abcdef0123456789abcdef
+#   BOT_TOKEN=123456:ABCdefGhIJK-LMNOPqrsTuVwxyZ
+#   SA_JSON={"type":"service_account",...}
+#   SERVICE_ACCOUNT_FILE=sa.json
+#   DRIVE_FOLDER_ID=1AbCdEfGhIJkLmNoPQ (optional)
 
-import os, asyncio, tempfile, mimetypes, textwrap
+import os
+import asyncio
+import tempfile
+import mimetypes
+import textwrap
 from pathlib import Path
-from datetime import datetime
 
 from pyrogram import Client, filters
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery     import build
-from googleapiclient.http          import MediaIoBaseUpload
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
-# ───────────────────────────── 1. CONFIG / ENV ─────────────────────────────
-if Path(".env").exists():                      # auto-load .env for local dev
+# ───────────────────────────── CONFIG / ENV ─────────────────────────────
+# Auto-load .env for local development
+if Path(".env").exists():
     from dotenv import load_dotenv
     load_dotenv(override=True)
 
 def env(name: str, default: str | None = None):
+    """Get environment variable and strip whitespace."""
     val = os.getenv(name, default)
     return val.strip() if isinstance(val, str) else val
 
-APP_ID    = int(env("APP_ID", "0"))
-API_HASH  = env("API_HASH", "")
+# Telegram credentials
+APP_ID = int(env("APP_ID", "0"))
+API_HASH = env("API_HASH", "")
 BOT_TOKEN = env("BOT_TOKEN", "")
 
-SA_JSON_ENV          = env("SA_JSON")                    # entire JSON pasted in an env-var
+# Google Drive service account
+SA_JSON_ENV = env("SA_JSON")
 SERVICE_ACCOUNT_FILE = env("SERVICE_ACCOUNT_FILE", "sa.json")
-DRIVE_FOLDER_ID      = env("DRIVE_FOLDER_ID") or None
+DRIVE_FOLDER_ID = env("DRIVE_FOLDER_ID") or None
 
+# Validate required credentials
 missing = [k for k, v in {"APP_ID": APP_ID, "API_HASH": API_HASH, "BOT_TOKEN": BOT_TOKEN}.items() if not v]
 if missing:
-    raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-# ───────────────── 2. Ensure service-account key exists on disk ────────────
+# ───────────────── Ensure service-account key exists on disk ────────────
 key_path = Path(SERVICE_ACCOUNT_FILE)
 if not key_path.exists():
     if not SA_JSON_ENV:
         raise RuntimeError(
-            "Service-account file not found and SA_JSON env var is empty.\n"
+            "Service-account file not found and SA_JSON environment variable is empty.\n"
             "Provide one of them so the bot can authenticate with Google Drive."
         )
+    # Write the JSON key to disk
     key_path.write_text(textwrap.dedent(SA_JSON_ENV), encoding="utf-8")
     print(f"[init] Wrote service-account key to {key_path.resolve()}")
 
-# ─────────────────────── 3. Google Drive client ────────────────────────────
+# ─────────────────────── Google Drive client ────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-creds  = Credentials.from_service_account_file(key_path, scopes=SCOPES)
-drive  = build("drive", "v3", credentials=creds, cache_discovery=False)
-print("[init] Google Drive service created")
+try:
+    creds = Credentials.from_service_account_file(key_path, scopes=SCOPES)
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    print("[init] Google Drive service created")
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize Google Drive service: {e}")
 
-# ─────────────────────── 4. Telegram client ────────────────────────────────
+# ─────────────────────── Telegram client ────────────────────────────────
 bot = Client(
     "gdrive-uploader-session",
     api_id=APP_ID,
@@ -77,59 +88,95 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ───────────────────── 5. Helper: upload to Drive ──────────────────────────
+# ───────────────────── Helper function: upload to Drive ──────────────────
 def upload_to_drive(local_path: str, remote_name: str) -> str:
-    mime = mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
-    media = MediaIoBaseUpload(open(local_path, "rb"), mimetype=mime, resumable=True)
-    body  = {"name": remote_name}
+    """Upload a local file to Google Drive and return the shareable link."""
+    mime_type = mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
+    
+    with open(local_path, "rb") as f:
+        media = MediaIoBaseUpload(f, mimetype=mime_type, resumable=True)
+        
+    body = {"name": remote_name}
     if DRIVE_FOLDER_ID:
         body["parents"] = [DRIVE_FOLDER_ID]
 
-    file = drive.files().create(body=body, media_body=media, fields="id, webViewLink").execute()
+    file = drive.files().create(
+        body=body, 
+        media_body=media, 
+        fields="id, webViewLink"
+    ).execute()
+    
     return file["webViewLink"]
 
-# ───────────────────── 6. Telegram handlers ────────────────────────────────
+# ───────────────────── Telegram message handlers ────────────────────────
 @bot.on_message(filters.command("start"))
-async def cmd_start(_, m):
-    await m.reply_text(
-        "👋 Hi!\n"
-        "Send me any document / photo / audio / video and "
-        "I’ll upload it to Google Drive and return a link."
+async def cmd_start(_, message):
+    await message.reply_text(
+        "👋 **Hi there!**\n\n"
+        "Send me any **document**, **photo**, **audio**, or **video** file "
+        "and I'll upload it to Google Drive and send you a shareable link back.\n\n"
+        "Just drop your file and wait for the magic! ✨"
     )
 
 @bot.on_message(filters.document | filters.audio | filters.video | filters.photo)
-async def handle_file(client, msg):
-    media = msg.document or msg.video or msg.audio or msg.photo
+async def handle_file(client, message):
+    """Handle incoming files and upload them to Google Drive."""
+    media = message.document or message.video or message.audio or message.photo
 
-    # 1) Build a safe filename
-    if getattr(media, "file_name", None):          # documents, videos, audios
+    # Generate appropriate filename
+    if hasattr(media, "file_name") and media.file_name:
         file_name = media.file_name
-    else:                                          # photos have no file_name
-        uid = media.file_unique_id if not isinstance(media, list) else media[-1].file_unique_id
+    else:
+        # Photos don't have file_name attribute
+        if isinstance(media, list):  # Photo array
+            uid = media[-1].file_unique_id
+        else:
+            uid = media.file_unique_id
         file_name = f"photo_{uid}.jpg"
 
-    progress = await msg.reply_text("⬇️ Downloading…")
+    # Show progress to user
+    progress_msg = await message.reply_text("⬇️ **Downloading file...**")
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = await client.download_media(media, tmpdir)
-
-            # 2) For photos Pyrogram returns a **directory** → pick the largest file
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Download the media
+            local_path = await client.download_media(media, temp_dir)
+            
+            # Handle photos: Pyrogram returns a directory, we need to pick a file
             if os.path.isdir(local_path):
-                import os
                 files = [os.path.join(local_path, f) for f in os.listdir(local_path)]
+                if not files:
+                    raise RuntimeError("Downloaded photo directory is empty")
+                # Pick the largest file (highest quality)
                 local_path = max(files, key=os.path.getsize)
 
-            await progress.edit_text("⬆️ Uploading to Google Drive…")
-            link = await asyncio.to_thread(upload_to_drive, local_path, file_name)
+            await progress_msg.edit_text("⬆️ **Uploading to Google Drive...**")
+            
+            # Upload to Google Drive in a separate thread
+            drive_link = await asyncio.to_thread(upload_to_drive, local_path, file_name)
 
-        await progress.edit_text(f"✅ Uploaded!\n{link}")
+        # Success message
+        await progress_msg.edit_text(
+            f"✅ **Upload successful!**\n\n"
+            f"📁 **File:** `{file_name}`\n"
+            f"🔗 **Link:** {drive_link}"
+        )
 
     except Exception as e:
-        await progress.edit_text(f"❌ Error: {e}")
-        raise  # keep traceback in logs
+        error_msg = f"❌ **Upload failed:** {str(e)}"
+        await progress_msg.edit_text(error_msg)
+        print(f"[ERROR] Upload failed for user {message.from_user.id}: {e}")
+        raise  # Keep full traceback in logs
 
-# ───────────────────────────── 7. Run bot ──────────────────────────────────
+# ───────────────────────────── Main execution ──────────────────────────
 if __name__ == "__main__":
-    print("[init] Bot starting …")
-    bot.run()
+    print("[init] Starting Google Drive Uploader Bot...")
+    print(f"[init] Target folder: {'My Drive (root)' if not DRIVE_FOLDER_ID else DRIVE_FOLDER_ID}")
+    
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        print("[init] Bot stopped by user")
+    except Exception as e:
+        print(f"[ERROR] Bot crashed: {e}")
+        raise
