@@ -10,3 +10,5 @@ google-auth-oauthlib==1.2.0
 
 # Local-only convenience (auto-loads .env)
 python-dotenv==1.0.1
+yt-dlp>=2024.1.7
+
