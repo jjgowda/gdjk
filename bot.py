@@ -1,4 +1,4 @@
-# bot.py ── Google-Drive Uploader + YouTube Downloader Telegram Bot
+# bot.py ── Google-Drive Uploader + YouTube Downloader (FIXED)
 #
 # Requirements (put in requirements.txt):
 #   pyrogram>=2.0.106
@@ -16,6 +16,7 @@ import tempfile
 import mimetypes
 import time
 import re
+import threading
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -126,7 +127,7 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ───────────────────── Progress Tracking Class ──────────────────────────
+# ───────────────────── Progress Tracking Class (FIXED) ─────────────────
 class ProgressTracker:
     def __init__(self, progress_msg, file_name, total_size=None):
         self.progress_msg = progress_msg
@@ -135,6 +136,15 @@ class ProgressTracker:
         self.uploaded_size = 0
         self.start_time = time.time()
         self.last_update = 0
+        
+        # For YouTube download progress (thread-safe)
+        self.download_progress = {
+            'downloaded': 0,
+            'total': 0,
+            'speed': None,
+            'last_update': 0
+        }
+        self.progress_lock = threading.Lock()
         
     def format_size(self, size_bytes):
         """Convert bytes to human readable format."""
@@ -151,35 +161,55 @@ class ProgressTracker:
         """Convert bytes per second to human readable format."""
         return self.format_size(speed_bps) + "/s"
     
-    async def update_download(self, downloaded_bytes, total_bytes=None, speed=None):
-        """Update download progress."""
+    def update_download_sync(self, downloaded_bytes, total_bytes=None, speed=None):
+        """Thread-safe update of download progress (called from yt-dlp hook)."""
+        with self.progress_lock:
+            self.download_progress['downloaded'] = downloaded_bytes
+            if total_bytes:
+                self.download_progress['total'] = total_bytes
+            if speed:
+                self.download_progress['speed'] = speed
+    
+    async def check_and_update_download(self):
+        """Check for download progress updates and update message if needed."""
         current_time = time.time()
         
-        # Only update every 2 seconds to avoid rate limits
-        if current_time - self.last_update < 2:
+        # Only update every 3 seconds to avoid rate limits
+        if current_time - self.last_update < 3:
+            return
+            
+        with self.progress_lock:
+            downloaded = self.download_progress['downloaded']
+            total = self.download_progress['total']
+            speed = self.download_progress['speed']
+        
+        if downloaded == 0:
             return
             
         self.last_update = current_time
         
-        if total_bytes:
-            progress_percent = (downloaded_bytes / total_bytes) * 100
+        if total and total > 0:
+            progress_percent = (downloaded / total) * 100
             bar_length = 10
             filled_length = int(bar_length * progress_percent / 100)
             bar = "█" * filled_length + "░" * (bar_length - filled_length)
             
+            speed_text = self.format_speed(speed) if speed else "calculating..."
+            
             progress_text = (
                 f"⬇️ **Downloading from YouTube...**\n\n"
-                f"📁 **Video:** `{self.file_name}`\n"
+                f"🎬 **Video:** `{self.file_name}`\n"
                 f"📊 **Progress:** {progress_percent:.1f}% `{bar}`\n"
-                f"📈 **Speed:** {speed or 'calculating...'}\n"
-                f"📦 **Size:** {self.format_size(downloaded_bytes)} / {self.format_size(total_bytes)}"
+                f"📈 **Speed:** {speed_text}\n"
+                f"📦 **Size:** {self.format_size(downloaded)} / {self.format_size(total)}"
             )
         else:
+            speed_text = self.format_speed(speed) if speed else "calculating..."
             progress_text = (
                 f"⬇️ **Downloading from YouTube...**\n\n"
-                f"📁 **Video:** `{self.file_name}`\n"
-                f"📦 **Downloaded:** {self.format_size(downloaded_bytes)}\n"
-                f"📈 **Speed:** {speed or 'calculating...'}"
+                f"🎬 **Video:** `{self.file_name}`\n"
+                f"📦 **Downloaded:** {self.format_size(downloaded)}\n"
+                f"📈 **Speed:** {speed_text}"
             )
         
         try:
@@ -240,27 +270,20 @@ class ProgressTracker:
         except Exception:
             pass
 
-# ───────────────────── YouTube Downloader ──────────────────────────────
+# ───────────────────── YouTube Downloader (FIXED) ─────────────────────
 class YouTubeDownloader:
     def __init__(self, progress_tracker):
         self.progress_tracker = progress_tracker
         
     def progress_hook(self, d):
-        """Progress hook for yt-dlp."""
+        """Progress hook for yt-dlp (runs in separate thread)."""
         if d['status'] == 'downloading':
             downloaded = d.get('downloaded_bytes', 0)
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
             speed = d.get('speed')
             
-            if speed:
-                speed_text = self.progress_tracker.format_speed(speed)
-            else:
-                speed_text = "calculating..."
-            
-            # Run update in async context
-            asyncio.create_task(
-                self.progress_tracker.update_download(downloaded, total, speed_text)
-            )
+            # Update progress data in thread-safe manner
+            self.progress_tracker.update_download_sync(downloaded, total, speed)
     
     async def download_video(self, url, output_dir):
         """Download video from YouTube and return file path."""
@@ -274,23 +297,43 @@ class YouTubeDownloader:
             'writeautomaticsub': False,
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info first
-            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-            video_title = info.get('title', 'Unknown Video')
-            
-            # Update progress tracker with video title
-            self.progress_tracker.file_name = f"{video_title}.{info.get('ext', 'mp4')}"
-            
-            # Download the video
-            await asyncio.to_thread(ydl.download, [url])
-            
-            # Find the downloaded file
-            for file in os.listdir(output_dir):
-                if file.endswith(('.mp4', '.mkv', '.webm', '.avi')):
-                    return os.path.join(output_dir, file)
-            
-            raise RuntimeError("Downloaded file not found")
+        # Start progress monitoring task
+        progress_task = asyncio.create_task(self._monitor_progress())
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Extract info first
+                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+                video_title = info.get('title', 'Unknown Video')
+                
+                # Update progress tracker with video title
+                self.progress_tracker.file_name = f"{video_title[:50]}{'...' if len(video_title) > 50 else ''}.{info.get('ext', 'mp4')}"
+                
+                # Download the video
+                await asyncio.to_thread(ydl.download, [url])
+                
+                # Find the downloaded file
+                for file in os.listdir(output_dir):
+                    if file.endswith(('.mp4', '.mkv', '.webm', '.avi')):
+                        return os.path.join(output_dir, file)
+                
+                raise RuntimeError("Downloaded file not found")
+        finally:
+            # Cancel progress monitoring
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+    
+    async def _monitor_progress(self):
+        """Monitor download progress and update UI."""
+        try:
+            while True:
+                await self.progress_tracker.check_and_update_download()
+                await asyncio.sleep(1)  # Check every second
+        except asyncio.CancelledError:
+            pass
 
 # ───────────────────── Helper: Upload to Drive (WITH PROGRESS) ──────────
 async def upload_to_drive_with_progress(local_path: str, remote_name: str, progress_tracker) -> str:
