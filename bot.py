@@ -1,4 +1,4 @@
-# bot.py ── Google-Drive Uploader + YouTube Downloader (FIXED)
+# bot.py ── Enhanced YouTube Downloader with Multi-Quality Support
 #
 # Requirements (put in requirements.txt):
 #   pyrogram>=2.0.106
@@ -17,6 +17,7 @@ import mimetypes
 import time
 import re
 import threading
+import subprocess
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -46,12 +47,8 @@ BOT_TOKEN = env("BOT_TOKEN", "")
 # Google OAuth credentials
 GOOGLE_CLIENT_ID = env("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = env("GOOGLE_CLIENT_SECRET", "")
-
-# OAuth tokens (get from Google OAuth Playground)
 OAUTH_TOKEN = env("OAUTH_TOKEN", "")
 OAUTH_REFRESH_TOKEN = env("OAUTH_REFRESH_TOKEN", "")
-
-# Optional: target folder
 DRIVE_FOLDER_ID = env("DRIVE_FOLDER_ID") or None
 
 # OAuth settings
@@ -69,27 +66,32 @@ missing = [k for k, v in {
 if missing:
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
+# ─────────────────────── FFmpeg Setup ──────────────────────────────────
+async def ensure_ffmpeg():
+    """Ensure FFmpeg is available for merging video+audio streams."""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        print("[init] FFmpeg found")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[init] FFmpeg not found, installing...")
+        try:
+            # Install FFmpeg on Railway/Ubuntu
+            subprocess.run(['apt-get', 'update'], check=True)
+            subprocess.run(['apt-get', 'install', '-y', 'ffmpeg'], check=True)
+            print("[init] FFmpeg installed successfully")
+            return True
+        except subprocess.CalledProcessError:
+            print("[init] Failed to install FFmpeg - 1080p downloads may fail")
+            return False
+
 # ─────────────────────── Google Drive OAuth Setup ────────────────────────
 def get_drive_service():
     """Initialize Google Drive service using OAuth credentials from env vars."""
     
     if not OAUTH_TOKEN or not OAUTH_REFRESH_TOKEN:
-        print("\n" + "="*60)
-        print("🔐 OAUTH SETUP REQUIRED")
-        print("="*60)
-        print("Use Google OAuth Playground to get tokens:")
-        print("1. Go to: https://developers.google.com/oauthplayground/")
-        print("2. Click gear icon → Use your own OAuth credentials")
-        print(f"3. Client ID: {GOOGLE_CLIENT_ID}")
-        print("4. Client Secret: [your secret]")
-        print("5. Select Drive API v3 scope")
-        print("6. Authorize and exchange for tokens")
-        print("7. Set OAUTH_TOKEN and OAUTH_REFRESH_TOKEN in Railway")
-        print("="*60)
-        
         raise RuntimeError("OAuth tokens missing - use OAuth Playground")
     
-    # Create credentials from environment variables
     creds = Credentials(
         token=OAUTH_TOKEN,
         refresh_token=OAUTH_REFRESH_TOKEN,
@@ -99,14 +101,12 @@ def get_drive_service():
         scopes=SCOPES
     )
     
-    # Refresh token if expired
     if creds.expired and creds.refresh_token:
         print("[oauth] Refreshing expired token...")
         try:
             creds.refresh(Request())
             print("[oauth] Token refreshed successfully")
         except Exception as e:
-            print(f"[oauth] Token refresh failed: {e}")
             raise RuntimeError("Token refresh failed - get new tokens from OAuth Playground")
     
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
@@ -127,7 +127,7 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ───────────────────── Progress Tracking Class (FIXED) ─────────────────
+# ───────────────────── Enhanced Progress Tracking ──────────────────────
 class ProgressTracker:
     def __init__(self, progress_msg, file_name, total_size=None):
         self.progress_msg = progress_msg
@@ -142,6 +142,7 @@ class ProgressTracker:
             'downloaded': 0,
             'total': 0,
             'speed': None,
+            'quality': None,
             'last_update': 0
         }
         self.progress_lock = threading.Lock()
@@ -161,20 +162,21 @@ class ProgressTracker:
         """Convert bytes per second to human readable format."""
         return self.format_size(speed_bps) + "/s"
     
-    def update_download_sync(self, downloaded_bytes, total_bytes=None, speed=None):
-        """Thread-safe update of download progress (called from yt-dlp hook)."""
+    def update_download_sync(self, downloaded_bytes, total_bytes=None, speed=None, quality=None):
+        """Thread-safe update of download progress."""
         with self.progress_lock:
             self.download_progress['downloaded'] = downloaded_bytes
             if total_bytes:
                 self.download_progress['total'] = total_bytes
             if speed:
                 self.download_progress['speed'] = speed
+            if quality:
+                self.download_progress['quality'] = quality
     
     async def check_and_update_download(self):
         """Check for download progress updates and update message if needed."""
         current_time = time.time()
         
-        # Only update every 3 seconds to avoid rate limits
         if current_time - self.last_update < 3:
             return
             
@@ -182,6 +184,7 @@ class ProgressTracker:
             downloaded = self.download_progress['downloaded']
             total = self.download_progress['total']
             speed = self.download_progress['speed']
+            quality = self.download_progress['quality']
         
         if downloaded == 0:
             return
@@ -195,21 +198,23 @@ class ProgressTracker:
             bar = "█" * filled_length + "░" * (bar_length - filled_length)
             
             speed_text = self.format_speed(speed) if speed else "calculating..."
+            quality_text = f" | **Quality:** {quality}" if quality else ""
             
             progress_text = (
                 f"⬇️ **Downloading from YouTube...**\n\n"
                 f"🎬 **Video:** `{self.file_name}`\n"
                 f"📊 **Progress:** {progress_percent:.1f}% `{bar}`\n"
-                f"📈 **Speed:** {speed_text}\n"
+                f"📈 **Speed:** {speed_text}{quality_text}\n"
                 f"📦 **Size:** {self.format_size(downloaded)} / {self.format_size(total)}"
             )
         else:
             speed_text = self.format_speed(speed) if speed else "calculating..."
+            quality_text = f" | **Quality:** {quality}" if quality else ""
             progress_text = (
                 f"⬇️ **Downloading from YouTube...**\n\n"
                 f"🎬 **Video:** `{self.file_name}`\n"
                 f"📦 **Downloaded:** {self.format_size(downloaded)}\n"
-                f"📈 **Speed:** {speed_text}"
+                f"📈 **Speed:** {speed_text}{quality_text}"
             )
         
         try:
@@ -224,22 +229,18 @@ class ProgressTracker:
             
         current_time = time.time()
         
-        # Only update every 2 seconds to avoid rate limits
         if current_time - self.last_update < 2:
             return
             
         self.last_update = current_time
         
-        # Calculate progress
         progress_percent = (uploaded_bytes / self.total_size) * 100
         elapsed_time = current_time - self.start_time
         
-        # Calculate speed
         if elapsed_time > 0:
             speed_bps = uploaded_bytes / elapsed_time
             speed_text = self.format_speed(speed_bps)
             
-            # Estimate remaining time
             if speed_bps > 0:
                 remaining_bytes = self.total_size - uploaded_bytes
                 eta_seconds = remaining_bytes / speed_bps
@@ -250,12 +251,10 @@ class ProgressTracker:
             speed_text = "calculating..."
             eta_text = "calculating..."
         
-        # Create progress bar
         bar_length = 10
         filled_length = int(bar_length * progress_percent / 100)
         bar = "█" * filled_length + "░" * (bar_length - filled_length)
         
-        # Update message
         progress_text = (
             f"⬆️ **Uploading to Google Drive...**\n\n"
             f"📁 **File:** `{self.file_name}`\n"
@@ -270,44 +269,114 @@ class ProgressTracker:
         except Exception:
             pass
 
-# ───────────────────── YouTube Downloader (FIXED) ─────────────────────
+# ───────────────────── Multi-Quality YouTube Downloader ─────────────────
 class YouTubeDownloader:
-    def __init__(self, progress_tracker):
+    def __init__(self, progress_tracker, quality_preference="best"):
         self.progress_tracker = progress_tracker
+        self.quality_preference = quality_preference
         
     def progress_hook(self, d):
-        """Progress hook for yt-dlp (runs in separate thread)."""
+        """Progress hook for yt-dlp."""
         if d['status'] == 'downloading':
             downloaded = d.get('downloaded_bytes', 0)
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
             speed = d.get('speed')
             
-            # Update progress data in thread-safe manner
-            self.progress_tracker.update_download_sync(downloaded, total, speed)
+            # Extract quality info if available
+            filename = d.get('filename', '')
+            quality = self._extract_quality_from_filename(filename)
+            
+            self.progress_tracker.update_download_sync(downloaded, total, speed, quality)
+    
+    def _extract_quality_from_filename(self, filename):
+        """Extract quality info from filename."""
+        if not filename:
+            return None
+            
+        # Look for resolution indicators
+        for res in ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p']:
+            if res in filename:
+                return res
+        return None
+    
+    def _get_format_string(self, quality):
+        """Get yt-dlp format string based on quality preference."""
+        format_options = {
+            "best": "bestvideo[height<=1080]+bestaudio/best",  # Auto-select up to 1080p
+            "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/best", 
+            "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+            "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+            "audio": "bestaudio/best"
+        }
+        
+        return format_options.get(quality, format_options["best"])
+    
+    async def get_video_info(self, url):
+        """Get video information including available qualities."""
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+            
+            # Extract available qualities
+            formats = info.get('formats', [])
+            qualities = set()
+            
+            for fmt in formats:
+                height = fmt.get('height')
+                if height:
+                    if height >= 2160:
+                        qualities.add('4K')
+                    elif height >= 1440:
+                        qualities.add('1440p')
+                    elif height >= 1080:
+                        qualities.add('1080p')
+                    elif height >= 720:
+                        qualities.add('720p')
+                    elif height >= 480:
+                        qualities.add('480p')
+                    else:
+                        qualities.add('360p')
+            
+            return {
+                'title': info.get('title', 'Unknown Video'),
+                'duration': info.get('duration', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'view_count': info.get('view_count', 0),
+                'qualities': sorted(qualities, key=lambda x: {'4K': 4, '1440p': 3, '1080p': 2, '720p': 1, '480p': 0, '360p': -1}.get(x, -2), reverse=True)
+            }
     
     async def download_video(self, url, output_dir):
-        """Download video from YouTube and return file path."""
+        """Download video with the best available quality."""
+        format_string = self._get_format_string(self.quality_preference)
+        
         ydl_opts = {
-            'format': 'best[height<=720]/best',  # Max 720p to save bandwidth
+            'format': format_string,
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
             'progress_hooks': [self.progress_hook],
             'no_warnings': True,
             'extractaudio': False,
             'writesubtitles': False,
             'writeautomaticsub': False,
+            'merge_output_format': 'mp4',  # Ensure MP4 output
         }
         
-        # Start progress monitoring task
+        # Start progress monitoring
         progress_task = asyncio.create_task(self._monitor_progress())
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract info first
+                # Extract info and update filename
                 info = await asyncio.to_thread(ydl.extract_info, url, download=False)
                 video_title = info.get('title', 'Unknown Video')
                 
-                # Update progress tracker with video title
-                self.progress_tracker.file_name = f"{video_title[:50]}{'...' if len(video_title) > 50 else ''}.{info.get('ext', 'mp4')}"
+                # Truncate long titles
+                safe_title = video_title[:50] + ('...' if len(video_title) > 50 else '')
+                self.progress_tracker.file_name = f"{safe_title}.mp4"
                 
                 # Download the video
                 await asyncio.to_thread(ydl.download, [url])
@@ -319,7 +388,6 @@ class YouTubeDownloader:
                 
                 raise RuntimeError("Downloaded file not found")
         finally:
-            # Cancel progress monitoring
             progress_task.cancel()
             try:
                 await progress_task
@@ -331,21 +399,19 @@ class YouTubeDownloader:
         try:
             while True:
                 await self.progress_tracker.check_and_update_download()
-                await asyncio.sleep(1)  # Check every second
+                await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
 
-# ───────────────────── Helper: Upload to Drive (WITH PROGRESS) ──────────
+# ───────────────────── Helper: Upload to Drive ──────────────────────────
 async def upload_to_drive_with_progress(local_path: str, remote_name: str, progress_tracker) -> str:
-    """Upload a local file to Google Drive with real-time progress updates."""
+    """Upload a local file to Google Drive with progress tracking."""
     mime_type = mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
     
-    # Get file size and update progress tracker
     file_size = os.path.getsize(local_path)
     progress_tracker.total_size = file_size
-    progress_tracker.start_time = time.time()  # Reset start time for upload
+    progress_tracker.start_time = time.time()
     
-    # Create media upload with progress callback
     media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
     
     body = {"name": remote_name}
@@ -353,16 +419,13 @@ async def upload_to_drive_with_progress(local_path: str, remote_name: str, progr
         body["parents"] = [DRIVE_FOLDER_ID]
     
     try:
-        # Create the file on Google Drive
         request = drive.files().create(body=body, media_body=media, fields="id, webViewLink")
         
         response = None
         while response is None:
-            # Execute next chunk of the upload
             status, response = request.next_chunk()
             
             if status:
-                # Update progress
                 uploaded_bytes = int(status.resumable_progress)
                 await progress_tracker.update_upload(uploaded_bytes)
         
@@ -379,8 +442,6 @@ def is_youtube_url(url):
         r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=[\w-]+',
         r'(?:https?://)?(?:www\.)?youtu\.be/[\w-]+',
         r'(?:https?://)?(?:www\.)?youtube\.com/embed/[\w-]+',
-        r'(?:https?://)?(?:www\.)?youtube\.com/v/[\w-]+',
-        r'(?:https?://)?(?:m\.)?youtube\.com/watch\?v=[\w-]+',
     ]
     
     for pattern in youtube_patterns:
@@ -388,134 +449,178 @@ def is_youtube_url(url):
             return True
     return False
 
+def parse_quality_command(text):
+    """Parse quality commands like '/yt 1080p URL' or '/ytaudio URL'."""
+    # Check for quality commands
+    patterns = [
+        r'/yt\s+(1080p?|720p?|480p?|360p?|best)\s+(.+)',
+        r'/ytaudio\s+(.+)',
+        r'/yt\s+(.+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            if 'ytaudio' in pattern:
+                return 'audio', match.group(1)
+            elif len(match.groups()) == 2:
+                return match.group(1).lower(), match.group(2)
+            else:
+                return 'best', match.group(1)
+    
+    return None, None
+
 # ───────────────────── Telegram Handlers ────────────────────────────────
 @bot.on_message(filters.command("start"))
 async def cmd_start(_, message):
     await message.reply_text(
-        "👋 **Welcome to Google Drive Uploader Bot!**\n\n"
-        "🎯 **What I can do:**\n\n"
-        "📁 **File Upload:** Send any document/photo/audio/video\n"
-        "🎬 **YouTube Download:** Send any YouTube URL\n\n"
+        "👋 **Welcome to Advanced YouTube Downloader + Drive Uploader!**\n\n"
+        "🎯 **Multi-Quality YouTube Downloads:**\n"
+        "• **Auto Quality:** Send any YouTube URL\n"
+        "• **1080p:** `/yt 1080p <URL>`\n"
+        "• **720p:** `/yt 720p <URL>`\n"
+        "• **Audio Only:** `/ytaudio <URL>`\n\n"
+        "📁 **Direct File Upload:** Send any file\n\n"
         "✨ **Features:**\n"
-        "• Real-time progress tracking\n"
-        "• Upload speed monitoring\n"
-        "• ETA calculation\n"
-        "• High-quality downloads (720p max)\n\n"
-        "🚀 **Ready to upload!**\n\n"
-        "💡 **Examples:**\n"
-        "`https://youtube.com/watch?v=xyz123`\n"
-        "`https://youtu.be/abc456`"
+        "• **Smart Quality Detection** - Automatically selects best available\n"
+        "• **1080p Support** - Full HD downloads with FFmpeg\n"
+        "• **Real-time Progress** - Speed, ETA, quality indicators\n"
+        "• **Multiple Formats** - MP4, Audio, any resolution\n\n"
+        "🚀 **Examples:**\n"
+        "`https://youtube.com/watch?v=xyz123` - Auto quality\n"
+        "`/yt 1080p https://youtu.be/abc456` - Force 1080p\n"
+        "`/ytaudio https://youtu.be/def789` - Audio only"
     )
 
-@bot.on_message(filters.text & ~filters.command([]))
+@bot.on_message(filters.text & ~filters.command(["start"]))
 async def handle_youtube_url(client, message):
-    """Handle YouTube URLs."""
+    """Handle YouTube URLs and quality commands."""
     text = message.text.strip()
     
-    if not is_youtube_url(text):
+    # Parse quality commands
+    quality, url = parse_quality_command(text)
+    
+    # If not a command, check if it's a direct URL
+    if not quality and is_youtube_url(text):
+        quality, url = "best", text
+    
+    if not quality or not is_youtube_url(url):
         await message.reply_text(
-            "❌ **Invalid URL**\n\n"
-            "Please send a valid YouTube URL like:\n"
-            "• `https://youtube.com/watch?v=xyz123`\n"
-            "• `https://youtu.be/abc456`\n\n"
-            "Or send a file directly for upload."
+            "❌ **Invalid URL or Command**\n\n"
+            "**Valid formats:**\n"
+            "• Direct URL: `https://youtube.com/watch?v=xyz123`\n"
+            "• Quality command: `/yt 1080p <URL>`\n"
+            "• Audio only: `/ytaudio <URL>`\n\n"
+            "**Supported qualities:** best, 1080p, 720p, 480p, 360p"
         )
         return
     
     # Show initial progress
-    progress_msg = await message.reply_text("🔍 **Extracting video info...**")
+    progress_msg = await message.reply_text("🔍 **Analyzing video...**")
     
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Create progress tracker
+            # Create downloader with quality preference
             progress_tracker = ProgressTracker(progress_msg, "Unknown Video")
+            downloader = YouTubeDownloader(progress_tracker, quality)
             
-            # Download video from YouTube
-            downloader = YouTubeDownloader(progress_tracker)
-            video_path = await downloader.download_video(text, temp_dir)
+            # Get video info first
+            video_info = await downloader.get_video_info(url)
+            
+            # Show video info
+            duration_min = video_info['duration'] // 60 if video_info['duration'] else 0
+            duration_sec = video_info['duration'] % 60 if video_info['duration'] else 0
+            available_qualities = ", ".join(video_info['qualities']) or "Unknown"
+            
+            await progress_msg.edit_text(
+                f"📺 **Video Found!**\n\n"
+                f"🎬 **Title:** {video_info['title'][:50]}{'...' if len(video_info['title']) > 50 else ''}\n"
+                f"⏱ **Duration:** {duration_min}m {duration_sec}s\n"
+                f"📺 **Available Qualities:** {available_qualities}\n"
+                f"🎯 **Downloading:** {quality.upper()}\n\n"
+                f"⬇️ **Starting download...**"
+            )
+            
+            # Download video
+            video_path = await downloader.download_video(url, temp_dir)
             
             if not video_path or not os.path.exists(video_path):
                 raise RuntimeError("Download failed - file not found")
             
-            # Get final filename
+            # Get final filename and start upload
             video_filename = os.path.basename(video_path)
             progress_tracker.file_name = video_filename
             
-            # Start upload to Google Drive
-            await progress_msg.edit_text("⬆️ **Preparing upload to Google Drive...**")
+            await progress_msg.edit_text("⬆️ **Preparing Google Drive upload...**")
             
-            # Upload with progress tracking
+            # Upload to Google Drive
             drive_link = await upload_to_drive_with_progress(video_path, video_filename, progress_tracker)
 
         # Success message
         await progress_msg.edit_text(
-            f"✅ **YouTube video uploaded successfully!**\n\n"  
+            f"✅ **YouTube Video Uploaded Successfully!**\n\n"  
             f"🎬 **Video:** `{video_filename}`\n"
-            f"🔗 **Google Drive Link:**\n{drive_link}\n\n"
+            f"🎯 **Quality:** {quality.upper()}\n"
+            f"📊 **Available:** {available_qualities}\n"
+            f"🔗 **Google Drive:**\n{drive_link}\n\n"
             f"🎉 **Ready for next download!**"
         )
 
     except Exception as e:
-        error_msg = f"❌ **YouTube download failed:** {str(e)}"
+        error_msg = f"❌ **Download failed:** {str(e)}"
         await progress_msg.edit_text(error_msg)
-        print(f"[ERROR] YouTube download failed for user {message.from_user.id}: {e}")
+        print(f"[ERROR] YouTube download failed: {e}")
 
 @bot.on_message(filters.document | filters.audio | filters.video | filters.photo)
 async def handle_file(client, message):
-    """Handle incoming files and upload them to Google Drive with progress."""
+    """Handle direct file uploads."""
     media = message.document or message.video or message.audio or message.photo
 
-    # Generate appropriate filename
     if hasattr(media, "file_name") and media.file_name:
         file_name = media.file_name
     else:
-        # Photos don't have file_name attribute
-        if isinstance(media, list):  # Photo array
+        if isinstance(media, list):
             uid = media[-1].file_unique_id
         else:
             uid = media.file_unique_id
         file_name = f"photo_{uid}.jpg"
 
-    # Show initial progress
     progress_msg = await message.reply_text("⬇️ **Downloading file...**")
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Download the media
             local_path = await client.download_media(media, temp_dir)
             
-            # Handle photos: Pyrogram returns a directory, we need to pick a file
             if os.path.isdir(local_path):
                 files = [os.path.join(local_path, f) for f in os.listdir(local_path)]
                 if not files:
                     raise RuntimeError("Downloaded photo directory is empty")
-                # Pick the largest file (highest quality)
                 local_path = max(files, key=os.path.getsize)
 
-            # Create progress tracker and start upload
             file_size = os.path.getsize(local_path)
             progress_tracker = ProgressTracker(progress_msg, file_name, file_size)
             
-            # Upload to Google Drive with progress updates
             drive_link = await upload_to_drive_with_progress(local_path, file_name, progress_tracker)
 
-        # Success message
         await progress_msg.edit_text(
             f"✅ **File uploaded successfully!**\n\n"  
             f"📁 **File:** `{file_name}`\n"
-            f"🔗 **Google Drive Link:**\n{drive_link}\n\n"
+            f"🔗 **Google Drive:**\n{drive_link}\n\n"
             f"🎉 **Ready for next upload!**"
         )
 
     except Exception as e:
         error_msg = f"❌ **Upload failed:** {str(e)}"
         await progress_msg.edit_text(error_msg)
-        print(f"[ERROR] Upload failed for user {message.from_user.id}: {e}")
+        print(f"[ERROR] Upload failed: {e}")
 
 # ───────────────────────────── Main ──────────────────────────────────────
 if __name__ == "__main__":
-    print("[init] Starting Google Drive Uploader + YouTube Downloader Bot...")
+    print("[init] Starting Advanced YouTube + Google Drive Bot...")
     print(f"[init] Target folder: {'My Drive (root)' if not DRIVE_FOLDER_ID else DRIVE_FOLDER_ID}")
+    
+    # Ensure FFmpeg is available for 1080p downloads
+    asyncio.run(ensure_ffmpeg())
     
     try:
         bot.run()
