@@ -1,4 +1,4 @@
-# bot.py ── Enhanced YouTube Downloader with Multi-Quality Support
+# bot.py ── Advanced YouTube Downloader + Google Drive Uploader Bot
 #
 # Requirements (put in requirements.txt):
 #   pyrogram>=2.0.106
@@ -66,8 +66,8 @@ missing = [k for k, v in {
 if missing:
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-# ─────────────────────── FFmpeg Setup ──────────────────────────────────
-async def ensure_ffmpeg():
+# ─────────────────────── FFmpeg Setup (FIXED) ──────────────────────────
+def ensure_ffmpeg():
     """Ensure FFmpeg is available for merging video+audio streams."""
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
@@ -90,8 +90,22 @@ def get_drive_service():
     """Initialize Google Drive service using OAuth credentials from env vars."""
     
     if not OAUTH_TOKEN or not OAUTH_REFRESH_TOKEN:
+        print("\n" + "="*60)
+        print("🔐 OAUTH SETUP REQUIRED")
+        print("="*60)
+        print("Use Google OAuth Playground to get tokens:")
+        print("1. Go to: https://developers.google.com/oauthplayground/")
+        print("2. Click gear icon → Use your own OAuth credentials")
+        print(f"3. Client ID: {GOOGLE_CLIENT_ID}")
+        print("4. Client Secret: [your secret]")
+        print("5. Select Drive API v3 scope")
+        print("6. Authorize and exchange for tokens")
+        print("7. Set OAUTH_TOKEN and OAUTH_REFRESH_TOKEN in Railway")
+        print("="*60)
+        
         raise RuntimeError("OAuth tokens missing - use OAuth Playground")
     
+    # Create credentials from environment variables
     creds = Credentials(
         token=OAUTH_TOKEN,
         refresh_token=OAUTH_REFRESH_TOKEN,
@@ -101,12 +115,14 @@ def get_drive_service():
         scopes=SCOPES
     )
     
+    # Refresh token if expired
     if creds.expired and creds.refresh_token:
         print("[oauth] Refreshing expired token...")
         try:
             creds.refresh(Request())
             print("[oauth] Token refreshed successfully")
         except Exception as e:
+            print(f"[oauth] Token refresh failed: {e}")
             raise RuntimeError("Token refresh failed - get new tokens from OAuth Playground")
     
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
@@ -614,13 +630,13 @@ async def handle_file(client, message):
         await progress_msg.edit_text(error_msg)
         print(f"[ERROR] Upload failed: {e}")
 
-# ───────────────────────────── Main ──────────────────────────────────────
+# ───────────────────────────── Main (FIXED) ──────────────────────────
 if __name__ == "__main__":
     print("[init] Starting Advanced YouTube + Google Drive Bot...")
     print(f"[init] Target folder: {'My Drive (root)' if not DRIVE_FOLDER_ID else DRIVE_FOLDER_ID}")
     
-    # Ensure FFmpeg is available for 1080p downloads
-    asyncio.run(ensure_ffmpeg())
+    # Ensure FFmpeg is available for 1080p downloads (NO asyncio.run!)
+    ensure_ffmpeg()
     
     try:
         bot.run()
