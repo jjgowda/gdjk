@@ -1,4 +1,4 @@
-# bot.py ── Google-Drive Uploader Telegram Bot (Complete Working Version)
+# bot.py ── Google-Drive Uploader Telegram Bot (With Progress & Speed)
 #
 # Requirements (put in requirements.txt):
 #   pyrogram>=2.0.106
@@ -13,6 +13,7 @@ import os
 import asyncio
 import tempfile
 import mimetypes
+import time
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -69,22 +70,6 @@ def get_drive_service():
     """Initialize Google Drive service using OAuth credentials from env vars."""
     
     if not OAUTH_TOKEN or not OAUTH_REFRESH_TOKEN:
-        # First time setup - generate auth URL for manual setup
-        client_config = {
-            "installed": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"]
-            }
-        }
-        
-        flow = Flow.from_client_config(client_config, SCOPES)
-        flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-        
-        auth_url, _ = flow.authorization_url(prompt='consent')
-        
         print("\n" + "="*60)
         print("🔐 OAUTH SETUP REQUIRED")
         print("="*60)
@@ -138,12 +123,95 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ───────────────────── Helper: Upload to Drive (FIXED) ──────────────────
-def upload_to_drive(local_path: str, remote_name: str) -> str:
-    """Upload a local file to Google Drive and return the shareable link."""
+# ───────────────────── Progress Tracking Class ──────────────────────────
+class UploadProgress:
+    def __init__(self, progress_msg, file_name, total_size):
+        self.progress_msg = progress_msg
+        self.file_name = file_name
+        self.total_size = total_size
+        self.uploaded_size = 0
+        self.start_time = time.time()
+        self.last_update = 0
+        
+    def format_size(self, size_bytes):
+        """Convert bytes to human readable format."""
+        if size_bytes == 0:
+            return "0 B"
+        size_names = ["B", "KB", "MB", "GB"]
+        i = 0
+        while size_bytes >= 1024 and i < len(size_names) - 1:
+            size_bytes /= 1024.0
+            i += 1
+        return f"{size_bytes:.1f} {size_names[i]}"
+    
+    def format_speed(self, speed_bps):
+        """Convert bytes per second to human readable format."""
+        return self.format_size(speed_bps) + "/s"
+    
+    async def update(self, uploaded_bytes):
+        """Update progress with current uploaded bytes."""
+        self.uploaded_size = uploaded_bytes
+        current_time = time.time()
+        
+        # Only update every 2 seconds to avoid rate limits
+        if current_time - self.last_update < 2:
+            return
+            
+        self.last_update = current_time
+        
+        # Calculate progress
+        progress_percent = (uploaded_bytes / self.total_size) * 100
+        elapsed_time = current_time - self.start_time
+        
+        # Calculate speed
+        if elapsed_time > 0:
+            speed_bps = uploaded_bytes / elapsed_time
+            speed_text = self.format_speed(speed_bps)
+            
+            # Estimate remaining time
+            if speed_bps > 0:
+                remaining_bytes = self.total_size - uploaded_bytes
+                eta_seconds = remaining_bytes / speed_bps
+                eta_text = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+            else:
+                eta_text = "calculating..."
+        else:
+            speed_text = "calculating..."
+            eta_text = "calculating..."
+        
+        # Create progress bar
+        bar_length = 10
+        filled_length = int(bar_length * progress_percent / 100)
+        bar = "█" * filled_length + "░" * (bar_length - filled_length)
+        
+        # Update message
+        progress_text = (
+            f"⬆️ **Uploading to Google Drive...**\n\n"
+            f"📁 **File:** `{self.file_name}`\n"
+            f"📊 **Progress:** {progress_percent:.1f}% `{bar}`\n"
+            f"📈 **Speed:** {speed_text}\n"
+            f"📦 **Size:** {self.format_size(uploaded_bytes)} / {self.format_size(self.total_size)}\n"
+            f"⏱ **ETA:** {eta_text}"
+        )
+        
+        try:
+            await self.progress_msg.edit_text(progress_text)
+        except Exception as e:
+            # Ignore rate limit errors
+            pass
+
+# ───────────────────── Helper: Upload to Drive (WITH PROGRESS) ──────────
+async def upload_to_drive_with_progress(local_path: str, remote_name: str, progress_msg) -> str:
+    """Upload a local file to Google Drive with real-time progress updates."""
     mime_type = mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
     
-    # Use MediaFileUpload instead of MediaIoBaseUpload to avoid "seek of closed file" error
+    # Get file size
+    file_size = os.path.getsize(local_path)
+    
+    # Create progress tracker
+    progress_tracker = UploadProgress(progress_msg, remote_name, file_size)
+    
+    # Create media upload with progress callback
     media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
     
     body = {"name": remote_name}
@@ -151,13 +219,21 @@ def upload_to_drive(local_path: str, remote_name: str) -> str:
         body["parents"] = [DRIVE_FOLDER_ID]
     
     try:
-        file = drive.files().create(
-            body=body,
-            media_body=media,
-            fields="id, webViewLink"
-        ).execute()
+        # Create the file on Google Drive
+        request = drive.files().create(body=body, media_body=media, fields="id, webViewLink")
         
-        return file["webViewLink"]
+        response = None
+        while response is None:
+            # Execute next chunk of the upload
+            status, response = request.next_chunk()
+            
+            if status:
+                # Update progress
+                uploaded_bytes = int(status.resumable_progress)
+                await progress_tracker.update(uploaded_bytes)
+        
+        return response["webViewLink"]
+        
     except Exception as e:
         print(f"[ERROR] Drive upload failed: {e}")
         raise
@@ -168,13 +244,18 @@ async def cmd_start(_, message):
     await message.reply_text(
         "👋 **Hi there!**\n\n"
         "Send me any **document**, **photo**, **audio**, or **video** file "
-        "and I'll upload it to Google Drive using OAuth authentication.\n\n"
-        "✨ **No storage quota or permission issues!** ✨"
+        "and I'll upload it to Google Drive with **real-time progress**!\n\n"
+        "✨ **Features:**\n"
+        "• Upload speed monitoring\n"
+        "• Progress percentage\n"
+        "• ETA calculation\n"
+        "• File size display\n\n"
+        "🚀 **Ready to upload!**"
     )
 
 @bot.on_message(filters.document | filters.audio | filters.video | filters.photo)
 async def handle_file(client, message):
-    """Handle incoming files and upload them to Google Drive."""
+    """Handle incoming files and upload them to Google Drive with progress."""
     media = message.document or message.video or message.audio or message.photo
 
     # Generate appropriate filename
@@ -188,7 +269,7 @@ async def handle_file(client, message):
             uid = media.file_unique_id
         file_name = f"photo_{uid}.jpg"
 
-    # Show progress to user
+    # Show initial progress
     progress_msg = await message.reply_text("⬇️ **Downloading file...**")
 
     try:
@@ -204,27 +285,28 @@ async def handle_file(client, message):
                 # Pick the largest file (highest quality)
                 local_path = max(files, key=os.path.getsize)
 
-            await progress_msg.edit_text("⬆️ **Uploading to Google Drive...**")
+            # Start upload with progress tracking
+            await progress_msg.edit_text("⬆️ **Preparing upload...**")
             
-            # Upload to Google Drive (runs in thread to avoid blocking)
-            drive_link = await asyncio.to_thread(upload_to_drive, local_path, file_name)
+            # Upload to Google Drive with progress updates
+            drive_link = await upload_to_drive_with_progress(local_path, file_name, progress_msg)
 
         # Success message
         await progress_msg.edit_text(
-            f"✅ **Upload successful!**\n\n"  
+            f"✅ **Upload completed!**\n\n"  
             f"📁 **File:** `{file_name}`\n"
-            f"🔗 **Link:** {drive_link}"
+            f"🔗 **Google Drive Link:**\n{drive_link}\n\n"
+            f"🎉 **Ready for next upload!**"
         )
 
     except Exception as e:
         error_msg = f"❌ **Upload failed:** {str(e)}"
         await progress_msg.edit_text(error_msg)
         print(f"[ERROR] Upload failed for user {message.from_user.id}: {e}")
-        # Don't re-raise in production to avoid crashing the bot
 
 # ───────────────────────────── Main ──────────────────────────────────────
 if __name__ == "__main__":
-    print("[init] Starting Google Drive Uploader Bot...")
+    print("[init] Starting Google Drive Uploader Bot with Progress Tracking...")
     print(f"[init] Target folder: {'My Drive (root)' if not DRIVE_FOLDER_ID else DRIVE_FOLDER_ID}")
     
     try:
