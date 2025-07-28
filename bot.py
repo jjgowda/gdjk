@@ -1,4 +1,4 @@
-# bot.py ── Advanced YouTube Downloader + Google Drive Uploader Bot (MKV Quality)
+# bot.py ── YouTube Downloader + Google Drive Uploader Bot (720p MP4)
 #
 # Requirements (put in requirements.txt):
 #   pyrogram>=2.0.106
@@ -82,7 +82,7 @@ def ensure_ffmpeg():
             print("[init] FFmpeg installed successfully")
             return True
         except subprocess.CalledProcessError:
-            print("[init] Failed to install FFmpeg - high quality downloads may fail")
+            print("[init] Failed to install FFmpeg - 720p downloads may fail")
             return False
 
 # ─────────────────────── Google Drive OAuth Setup ────────────────────────
@@ -217,7 +217,7 @@ class ProgressTracker:
             quality_text = f" | **Quality:** {quality}" if quality else ""
             
             progress_text = (
-                f"⬇️ **Downloading from YouTube (MKV Quality)...**\n\n"
+                f"⬇️ **Downloading from YouTube...**\n\n"
                 f"🎬 **Video:** `{self.file_name}`\n"
                 f"📊 **Progress:** {progress_percent:.1f}% `{bar}`\n"
                 f"📈 **Speed:** {speed_text}{quality_text}\n"
@@ -227,7 +227,7 @@ class ProgressTracker:
             speed_text = self.format_speed(speed) if speed else "calculating..."
             quality_text = f" | **Quality:** {quality}" if quality else ""
             progress_text = (
-                f"⬇️ **Downloading from YouTube (MKV Quality)...**\n\n"
+                f"⬇️ **Downloading from YouTube...**\n\n"
                 f"🎬 **Video:** `{self.file_name}`\n"
                 f"📦 **Downloaded:** {self.format_size(downloaded)}\n"
                 f"📈 **Speed:** {speed_text}{quality_text}"
@@ -285,7 +285,7 @@ class ProgressTracker:
         except Exception:
             pass
 
-# ───────────────────── High-Quality MKV YouTube Downloader ─────────────────
+# ───────────────────── YouTube Downloader (720p MP4) ─────────────────
 class YouTubeDownloader:
     def __init__(self, progress_tracker, quality_preference="best"):
         self.progress_tracker = progress_tracker
@@ -305,34 +305,25 @@ class YouTubeDownloader:
             self.progress_tracker.update_download_sync(downloaded, total, speed, quality)
     
     def _extract_quality_from_filename(self, filename):
-        """Extract quality info from filename including codec information."""
+        """Extract quality info from filename."""
         if not filename:
             return None
             
-        # Look for resolution indicators and codec info
-        for res in ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p']:
+        # Look for resolution indicators
+        for res in ['720p', '480p', '360p', '240p']:
             if res in filename:
-                # Add codec info if available
-                if 'vp9' in filename.lower():
-                    return f"{res} (VP9)"
-                elif 'av1' in filename.lower():
-                    return f"{res} (AV1)"
-                elif 'webm' in filename.lower():
-                    return f"{res} (WebM)"
-                else:
-                    return res
+                return res
         return None
     
     def _get_format_string(self, quality):
-        """Get yt-dlp format string optimized for MKV quality."""
+        """Get yt-dlp format string optimized for 720p MP4."""
         format_options = {
-            # Best quality with VP9/AV1 preference for MKV - prioritizes quality over compatibility
-            "best": "bestvideo[ext=webm][height<=1080]+bestaudio[ext=webm]/bestvideo[height<=1080]+bestaudio/best",
-            "1080p": "bestvideo[ext=webm][height<=1080]+bestaudio[ext=webm]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-            "720p": "bestvideo[ext=webm][height<=720]+bestaudio[ext=webm]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-            "480p": "bestvideo[ext=webm][height<=480]+bestaudio[ext=webm]/bestvideo[height<=480]+bestaudio/best[height<=480]",
-            "360p": "bestvideo[ext=webm][height<=360]+bestaudio[ext=webm]/bestvideo[height<=360]+bestaudio/best[height<=360]",
-            "audio": "bestaudio[ext=webm]/bestaudio/best"
+            # Best quality capped at 720p for faster downloads and smaller files
+            "best": "best[height<=720]/best",
+            "720p": "best[height<=720]/best",
+            "480p": "best[height<=480]/best",
+            "360p": "best[height<=360]/best",
+            "audio": "bestaudio/best"
         }
         
         return format_options.get(quality, format_options["best"])
@@ -354,13 +345,7 @@ class YouTubeDownloader:
             for fmt in formats:
                 height = fmt.get('height')
                 if height:
-                    if height >= 2160:
-                        qualities.add('4K')
-                    elif height >= 1440:
-                        qualities.add('1440p')
-                    elif height >= 1080:
-                        qualities.add('1080p')
-                    elif height >= 720:
+                    if height >= 720:
                         qualities.add('720p')
                     elif height >= 480:
                         qualities.add('480p')
@@ -372,11 +357,11 @@ class YouTubeDownloader:
                 'duration': info.get('duration', 0),
                 'uploader': info.get('uploader', 'Unknown'),
                 'view_count': info.get('view_count', 0),
-                'qualities': sorted(qualities, key=lambda x: {'4K': 4, '1440p': 3, '1080p': 2, '720p': 1, '480p': 0, '360p': -1}.get(x, -2), reverse=True)
+                'qualities': sorted(qualities, key=lambda x: {'720p': 2, '480p': 1, '360p': 0}.get(x, -1), reverse=True)
             }
     
     async def download_video(self, url, output_dir):
-        """Download video in high-quality MKV format."""
+        """Download video in 720p MP4 format."""
         format_string = self._get_format_string(self.quality_preference)
         
         ydl_opts = {
@@ -387,11 +372,6 @@ class YouTubeDownloader:
             'extractaudio': False,
             'writesubtitles': False,
             'writeautomaticsub': False,
-            'merge_output_format': 'mkv',  # Output in MKV format for best quality
-            'postprocessor_args': [
-                '-c:v', 'copy',  # Copy video without re-encoding (preserves quality)
-                '-c:a', 'copy',  # Copy audio without re-encoding (preserves quality)
-            ],
         }
         
         # Start progress monitoring
@@ -403,16 +383,16 @@ class YouTubeDownloader:
                 info = await asyncio.to_thread(ydl.extract_info, url, download=False)
                 video_title = info.get('title', 'Unknown Video')
                 
-                # Truncate long titles and use .mkv extension
+                # Truncate long titles
                 safe_title = video_title[:50] + ('...' if len(video_title) > 50 else '')
-                self.progress_tracker.file_name = f"{safe_title}.mkv"
+                self.progress_tracker.file_name = f"{safe_title}.mp4"
                 
                 # Download the video
                 await asyncio.to_thread(ydl.download, [url])
                 
-                # Find the downloaded file (prioritize .mkv files)
+                # Find the downloaded file
                 for file in os.listdir(output_dir):
-                    if file.endswith(('.mkv', '.webm', '.mp4')):
+                    if file.endswith(('.mp4', '.mkv', '.webm', '.avi')):
                         return os.path.join(output_dir, file)
                 
                 raise RuntimeError("Downloaded file not found")
@@ -479,10 +459,10 @@ def is_youtube_url(url):
     return False
 
 def parse_quality_command(text):
-    """Parse quality commands like '/yt 1080p URL' or '/ytaudio URL'."""
+    """Parse quality commands like '/yt 720p URL' or '/ytaudio URL'."""
     # Check for quality commands
     patterns = [
-        r'/yt\s+(1080p?|720p?|480p?|360p?|best)\s+(.+)',
+        r'/yt\s+(720p?|480p?|360p?|best)\s+(.+)',
         r'/ytaudio\s+(.+)',
         r'/yt\s+(.+)'
     ]
@@ -503,26 +483,26 @@ def parse_quality_command(text):
 @bot.on_message(filters.command("start"))
 async def cmd_start(_, message):
     await message.reply_text(
-        "👋 **Welcome to High-Quality YouTube Downloader + Drive Uploader!**\n\n"
-        "🎯 **Premium MKV Quality YouTube Downloads:**\n"
-        "• **Auto Quality:** Send any YouTube URL (MKV format)\n"
-        "• **1080p:** `/yt 1080p <URL>` - Full HD MKV\n"
-        "• **720p:** `/yt 720p <URL>` - HD MKV\n"
+        "👋 **Welcome to YouTube Downloader + Drive Uploader!**\n\n"
+        "🎯 **YouTube Downloads (720p HD):**\n"
+        "• **Auto Quality:** Send any YouTube URL (720p max)\n"
+        "• **720p:** `/yt 720p <URL>` - HD MP4\n"
+        "• **480p:** `/yt 480p <URL>` - Standard MP4\n"
         "• **Audio Only:** `/ytaudio <URL>` - High quality audio\n\n"
         "📁 **Direct File Upload:** Send any file\n\n"
-        "✨ **Premium Features:**\n"
-        "• **MKV Container** - Superior quality preservation\n"
-        "• **VP9/AV1 Codecs** - Best compression & quality\n"
-        "• **No Re-encoding** - Lossless video/audio merge\n"
-        "• **Real-time Progress** - Speed, ETA, codec indicators\n"
-        "• **1080p Support** - Full HD with FFmpeg\n\n"
-        "🎬 **Quality Benefits:**\n"
-        "• **20-40% better quality** than MP4\n"
-        "• **Higher bitrates** preserved\n"
-        "• **Multiple audio tracks** support\n\n"
+        "✨ **Features:**\n"
+        "• **720p HD Quality** - Perfect balance of quality & file size\n"
+        "• **MP4 Format** - Universal compatibility\n"
+        "• **Real-time Progress** - Speed, ETA, quality indicators\n"
+        "• **Fast Downloads** - Optimized for speed\n"
+        "• **Google Drive Upload** - Direct storage\n\n"
+        "🎬 **Benefits:**\n"
+        "• **Excellent 720p quality** for all devices\n"
+        "• **Faster downloads** than higher resolutions\n"
+        "• **Smaller file sizes** for storage efficiency\n\n"
         "🚀 **Examples:**\n"
-        "`https://youtube.com/watch?v=xyz123` - Best MKV quality\n"
-        "`/yt 1080p https://youtu.be/abc456` - Force 1080p MKV\n"
+        "`https://youtube.com/watch?v=xyz123` - Auto 720p\n"
+        "`/yt 720p https://youtu.be/abc456` - Force 720p\n"
         "`/ytaudio https://youtu.be/def789` - Audio only"
     )
 
@@ -543,15 +523,15 @@ async def handle_youtube_url(client, message):
             "❌ **Invalid URL or Command**\n\n"
             "**Valid formats:**\n"
             "• Direct URL: `https://youtube.com/watch?v=xyz123`\n"
-            "• Quality command: `/yt 1080p <URL>`\n"
+            "• Quality command: `/yt 720p <URL>`\n"
             "• Audio only: `/ytaudio <URL>`\n\n"
-            "**Supported qualities:** best, 1080p, 720p, 480p, 360p\n"
-            "**Output format:** High-quality MKV container"
+            "**Supported qualities:** best, 720p, 480p, 360p\n"
+            "**Output format:** MP4 (720p maximum)"
         )
         return
     
     # Show initial progress
-    progress_msg = await message.reply_text("🔍 **Analyzing video for MKV quality...**")
+    progress_msg = await message.reply_text("🔍 **Analyzing video...**")
     
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -568,13 +548,13 @@ async def handle_youtube_url(client, message):
             available_qualities = ", ".join(video_info['qualities']) or "Unknown"
             
             await progress_msg.edit_text(
-                f"📺 **High-Quality Video Found!**\n\n"
+                f"📺 **Video Found!**\n\n"
                 f"🎬 **Title:** {video_info['title'][:50]}{'...' if len(video_info['title']) > 50 else ''}\n"
                 f"⏱ **Duration:** {duration_min}m {duration_sec}s\n"
                 f"📺 **Available Qualities:** {available_qualities}\n"
-                f"🎯 **Downloading:** {quality.upper()} (MKV)\n"
-                f"🎨 **Container:** MKV (Superior Quality)\n\n"
-                f"⬇️ **Starting high-quality download...**"
+                f"🎯 **Downloading:** {quality.upper()} (MP4)\n"
+                f"🎨 **Format:** MP4 (720p HD Max)\n\n"
+                f"⬇️ **Starting download...**"
             )
             
             # Download video
@@ -597,14 +577,14 @@ async def handle_youtube_url(client, message):
 
         # Success message
         await progress_msg.edit_text(
-            f"✅ **High-Quality MKV Video Uploaded!**\n\n"  
+            f"✅ **YouTube Video Uploaded Successfully!**\n\n"  
             f"🎬 **Video:** `{video_filename}`\n"
-            f"🎯 **Quality:** {quality.upper()} (MKV Container)\n"
+            f"🎯 **Quality:** {quality.upper()} (MP4)\n"
             f"📊 **Available:** {available_qualities}\n"
             f"📦 **File Size:** {file_size}\n"
-            f"🎨 **Benefits:** VP9/AV1 codecs, no quality loss\n"
+            f"🎨 **Format:** MP4 (720p HD)\n"
             f"🔗 **Google Drive:**\n{drive_link}\n\n"
-            f"🎉 **Ready for next high-quality download!**"
+            f"🎉 **Ready for next download!**"
         )
 
     except Exception as e:
@@ -657,11 +637,12 @@ async def handle_file(client, message):
 
 # ───────────────────────────── Main ──────────────────────────────────────
 if __name__ == "__main__":
-    print("[init] Starting High-Quality MKV YouTube + Google Drive Bot...")
+    print("[init] Starting YouTube + Google Drive Bot (720p MP4)...")
     print(f"[init] Target folder: {'My Drive (root)' if not DRIVE_FOLDER_ID else DRIVE_FOLDER_ID}")
-    print("[init] Output format: MKV (High Quality)")
+    print("[init] Max quality: 720p HD")
+    print("[init] Output format: MP4")
     
-    # Ensure FFmpeg is available for high-quality downloads
+    # Ensure FFmpeg is available
     ensure_ffmpeg()
     
     try:
